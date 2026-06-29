@@ -40,6 +40,12 @@ const LINE_ITEM_HEADERS = [
   'Needs Review',
   'Payment Declined',
   'Shipping Delayed',
+  'Price Paid',
+  'Price Per Unit',
+  'Estimated ETA',
+  'ETA Source',
+  'Days Until ETA',
+  'Overdue',
 ];
 
 function line_item_key(orderNumber, normalizedItemName) {
@@ -62,7 +68,69 @@ function default_line_item_record(orderNumber, itemNameRaw, itemNameNormalized, 
     needs_review: false,
     payment_declined: false,
     shipping_delayed: false,
+    price_paid: '',
+    price_per_unit: '',
+    estimated_eta: '',
+    estimated_eta_source: '',
   };
+}
+
+/**
+ * ADDITIVE (reorder-reference feature): price per unit = price_paid / quantity.
+ * Returns '' when price or quantity is missing/zero (never throws).
+ *
+ * @param {string|number} pricePaid Line price.
+ * @param {string|number} quantity Quantity.
+ * @return {number|string} Rounded unit price, or ''.
+ */
+function computePricePerUnit(pricePaid, quantity) {
+  const price = parseFloat(pricePaid);
+  const qty = parseInt(quantity, 10);
+  if (pricePaid === '' || pricePaid == null || isNaN(price) || !qty || qty <= 0) {
+    return '';
+  }
+  return Math.round((price / qty) * 100) / 100;
+}
+
+/**
+ * Days from today until estimated_eta (negative = past). Blank when not an
+ * active Amazon estimate (e.g. delivered items use delivered_date instead).
+ *
+ * @param {string} estimatedEta ISO date.
+ * @param {string} etaSource 'amazon_estimate' | 'actual' | ''.
+ * @param {string} status Current line-item status.
+ * @return {number|string} Day count or ''.
+ */
+function computeDaysUntilEta(estimatedEta, etaSource, status) {
+  if (!estimatedEta || status === 'Delivered') {
+    return '';
+  }
+  if (etaSource !== 'amazon_estimate' && etaSource !== 'amazon_estimate_low') {
+    return '';
+  }
+  const today = isoDateUTC(new Date());
+  const diffMs = new Date(estimatedEta + 'T12:00:00Z').getTime() - new Date(today + 'T12:00:00Z').getTime();
+  return Math.round(diffMs / 86400000);
+}
+
+/**
+ * True when an Amazon-stated ETA has passed but no delivery email has arrived.
+ *
+ * @param {Object} record Line-item record.
+ * @return {boolean}
+ */
+function computeOverdue(record) {
+  if (record.current_status === 'Delivered') {
+    return false;
+  }
+  if (record.estimated_eta_source !== 'amazon_estimate' &&
+      record.estimated_eta_source !== 'amazon_estimate_low') {
+    return false;
+  }
+  if (!record.estimated_eta) {
+    return false;
+  }
+  return record.estimated_eta < isoDateUTC(new Date());
 }
 
 function normalize_line_item_record(record) {
@@ -425,6 +493,33 @@ function amazon_line_item_flags(subject) {
 }
 
 /**
+ * True when this email should contribute a shipping ETA (not order confirmation).
+ *
+ * @param {string|null} status Status from amazon_line_item_status.
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function shouldApplyShippingEta(status, subject) {
+  if (status === 'Delivered') {
+    return false;
+  }
+  if (status === 'Shipped' || status === 'Out for delivery' || status === 'Ordered') {
+    return true;
+  }
+  const subj = normalize_body(subject || '');
+  if (/^shipped\b|^out for delivery\b/i.test(subj)) {
+    return true;
+  }
+  if (/\bhas shipped\b/i.test(subj)) {
+    return true;
+  }
+  if (/\b(?:now\s+)?arriving\b/i.test(subj)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Applies new emails to prior state and returns the updated state Map.
  *
  * @param {Array<Object>} emails Source email objects (camelCase shape).
@@ -461,6 +556,9 @@ function update_amazon_line_item_state(emails, existingState) {
     const status = amazon_line_item_status(emailObj.subject);
     const emailDate = parse_email_date(emailObj.date) || '';
     const messageId = emailObj.messageId || '';
+    const priceMap = extractAmazonItemBlockPriceMap(normalizedBody);
+    const etaMap = extractAmazonItemBlockEtaMap(body, emailDate);
+    const emailLevelEta = extractAmazonEmailLevelEta(emailObj.subject, body, emailDate);
 
     const focusedOrder = focused_confirmation_order(emailObj.subject, normalizedBody);
     let itemBlocks = attribute_amazon_item_blocks(normalizedBody, itemOrders, orderOrderedDate, emailDate, focusedOrder);
@@ -496,6 +594,24 @@ function update_amazon_line_item_state(emails, existingState) {
       return;
     }
 
+    if (!itemBlocks.length && shouldApplyShippingEta(status, emailObj.subject) && emailLevelEta.eta) {
+      const etaOrder = extract_order_number((emailObj.subject || '') + ' ' + body, 'amazon.com');
+      if (etaOrder) {
+        state.forEach(function (record) {
+          if (record.order_number === etaOrder) {
+            record.estimated_eta = emailLevelEta.eta;
+            record.estimated_eta_source = emailLevelEta.source;
+            record.last_seen_email_date = max_iso_date(record.last_seen_email_date || '', emailDate);
+            if (messageId && record.contributing_message_ids.indexOf(messageId) === -1) {
+              record.contributing_message_ids.push(messageId);
+            }
+            advance_line_item_status(record, status, emailDate);
+          }
+        });
+      }
+      return;
+    }
+
     itemBlocks.forEach(function (itemBlock) {
       const itemOrderNumber = itemBlock.order_number || UNKNOWN_ORDER;
       const normalized = normalizeItemName(itemBlock.item_name).cleaned;
@@ -522,7 +638,39 @@ function update_amazon_line_item_state(emails, existingState) {
       if (itemBlock.needs_review) {
         record.needs_review = true;
       }
+      // ADDITIVE: capture per-item price (does not affect attribution/status).
+      if (itemBlock.position !== undefined) {
+        const price = priceMap.get(itemBlock.position);
+        if (price && price.price_paid) {
+          const parsed = parseFloat(price.price_paid);
+          if (!isNaN(parsed)) {
+            record.price_paid = parsed;
+          }
+        }
+      }
+      record.price_per_unit = computePricePerUnit(record.price_paid, record.quantity);
+      // ADDITIVE: capture Amazon-stated ETA from shipping / in-transit emails.
+      if (shouldApplyShippingEta(status, emailObj.subject)) {
+        let eta = '';
+        let etaSource = '';
+        if (itemBlock.position !== undefined) {
+          eta = etaMap.get(itemBlock.position) || '';
+        }
+        if (!eta && emailLevelEta.eta) {
+          eta = emailLevelEta.eta;
+          etaSource = emailLevelEta.source;
+        } else if (eta) {
+          etaSource = 'amazon_estimate';
+        }
+        if (eta) {
+          record.estimated_eta = eta;
+          record.estimated_eta_source = etaSource;
+        }
+      }
       advance_line_item_status(record, status, emailDate);
+      if (record.current_status === 'Delivered') {
+        record.estimated_eta_source = 'actual';
+      }
     });
   });
 
@@ -562,6 +710,10 @@ function loadTrackingState() {
       needs_review: toBool(cells[12]),
       payment_declined: toBool(cells[13]),
       shipping_delayed: toBool(cells[14]),
+      price_paid: toFloatCell(cells[15]),
+      price_per_unit: toFloatCell(cells[16]),
+      estimated_eta: cellToIso(cells[17]),
+      estimated_eta_source: String(cells[18] || ''),
     });
   }
   return state;
@@ -592,6 +744,12 @@ function saveTrackingState(state) {
       !!record.needs_review,
       !!record.payment_declined,
       !!record.shipping_delayed,
+      record.price_paid === '' || record.price_paid == null ? '' : record.price_paid,
+      record.price_per_unit === '' || record.price_per_unit == null ? '' : record.price_per_unit,
+      record.estimated_eta || '',
+      record.estimated_eta_source || '',
+      computeDaysUntilEta(record.estimated_eta, record.estimated_eta_source, record.current_status),
+      computeOverdue(record),
     ]);
   });
 

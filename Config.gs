@@ -14,6 +14,7 @@ const CONFIG = {
   TRACKING_TAB: 'LineItemTracking',
   INVENTORY_TAB: 'Inventory',
   UNATTRIBUTED_TAB: 'Unattributed',
+  REORDER_TAB: 'ReorderReference',
   RUN_LOG_TAB: 'RunLog',
 
   // Phase 0 / GmailReader query (matches the validated mbox subject filter).

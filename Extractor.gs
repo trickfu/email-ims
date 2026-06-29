@@ -339,6 +339,358 @@ function extractAmazonItemBlocksWithPositionsFromBody(body) {
   return blocks;
 }
 
+/**
+ * ADDITIVE (reorder-reference feature): maps each accepted item block's position
+ * to its per-item price, parsed from the amount that follows "Quantity: <n>",
+ * e.g. "... Quantity: 1 42.99 USD" or "... Quantity: 1 $42.99".
+ *
+ * The name/quantity portion of the regex is identical to
+ * extractAmazonItemBlocksWithPositionsFromBody, and the price clause is fully
+ * optional and only matches inside its own group, so match positions and the set
+ * of accepted blocks are unchanged — this only adds price metadata.
+ *
+ * @param {string} body Email body text.
+ * @return {Map<number, {price_paid: string, currency: string}>} position -> price.
+ */
+function extractAmazonItemBlockPriceMap(body) {
+  const normalized = normalize_body(body);
+  const re = /(?:^|\s)\*\s+(.+?)\s+(?:Quantity|Qty)\s*:\s*(\d+)\b(?:\s+(?:([0-9,]+\.[0-9]{2})\s*(USD|EUR|GBP)|([$€£])\s*([0-9,]+\.[0-9]{2})))?/gi;
+  const map = new Map();
+  for (const match of normalized.matchAll(re)) {
+    const candidate = clean_item_candidate(match[1]);
+    if (!candidate || is_ui_button_phrase(candidate) || is_sku_only_candidate(candidate)) {
+      continue;
+    }
+    let pricePaid = '';
+    let currency = '';
+    if (match[3]) {
+      pricePaid = match[3].replace(/,/g, '');
+      currency = String(match[4]).toUpperCase();
+    } else if (match[5] && match[6]) {
+      pricePaid = match[6].replace(/,/g, '');
+      currency = CURRENCY_SYMBOLS[match[5]] || match[5];
+    }
+    map.set(match.index, { price_paid: pricePaid, currency: currency });
+  }
+  return map;
+}
+
+const WEEKDAY_INDEX = {
+  sunday: 0, sun: 0, monday: 1, mon: 1, tuesday: 2, tue: 2, wednesday: 3, wed: 3,
+  thursday: 4, thu: 4, friday: 5, fri: 5, saturday: 6, sat: 6,
+};
+
+const AMAZON_ETA_MARKER_PATTERNS = [
+  /\bArriving:?\s+(today|tomorrow|(?:[A-Za-z]+day,?\s+)?[A-Za-z]+\.?\s+\d{1,2}(?:,\s*\d{4})?|[A-Za-z]+day)/gi,
+  /\bNow\s+Arriving\s+((?:[A-Za-z]+day,?\s+)?[A-Za-z]+\.?\s+\d{1,2}(?:,\s*\d{4})?)/gi,
+  /\bNow\s+arriving\s+([A-Za-z]+day)\b/gi,
+  /\bEstimated\s+delivery:?\s+((?:by\s+)?(?:today|tomorrow|(?:[A-Za-z]+day,?\s+)?[A-Za-z]+\.?\s+\d{1,2}(?:,\s*\d{4})?|[A-Za-z]+day))/gi,
+  /\bExpected\s+Delivery\s*:?\s*((?:[A-Za-z]+day,?\s+)?[A-Za-z]+\.?\s+\d{1,2}(?:,\s*\d{4})?)/gi,
+  /\b(?:guaranteed\s+)?delivery\s+date\s+is:?\s+((?:[A-Za-z]+day,?\s+)?[A-Za-z]+\.?\s+\d{1,2}(?:,\s*\d{4})?)/gi,
+  /\byour\s+package\s+will\s+arrive:?\s*((?:[A-Za-z]+day,?\s+)?[A-Za-z]+\.?\s+\d{1,2}(?:,\s*\d{4})?)/gi,
+  /\bpackage\s+will\s+be\s+delivered\s+(today)\b/gi,
+  /\bwill\s+arrive\s+by\s+this\s+evening\b/gi,
+  /\barrive(?:s)?\s+by:?\s+((?:today|tomorrow|(?:[A-Za-z]+day,?\s+)?[A-Za-z]+\.?\s+\d{1,2}(?:,\s*\d{4})?|[A-Za-z]+day))/gi,
+  /\bwill\s+arrive\s+(?:by\s+)?((?:today|tomorrow|(?:[A-Za-z]+day,?\s+)?[A-Za-z]+\.?\s+\d{1,2}(?:,\s*\d{4})?|[A-Za-z]+day))/gi,
+];
+
+const WEEKDAY_MONTH_DAY_RE =
+  /\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*,?\s*(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{1,2}(?:,\s*\d{4})?\b/gi;
+
+const AMAZON_SHIPPING_SECTION_START_RE =
+  /\b(?:your package was shipped|your package is out for delivery|shipping confirmation|your package will arrive|delivery estimate update|now arriving|arriving today|arriving tomorrow|expected delivery|has shipped)\b/i;
+
+/**
+ * Resolves the next occurrence of a weekday name on or after the reference date.
+ *
+ * @param {string} weekdayName Weekday token (e.g. "Wednesday").
+ * @param {Date} refDate Reference date (UTC noon).
+ * @return {string} ISO date or ''.
+ */
+function nextWeekdayIso(weekdayName, refDate) {
+  const targetDay = WEEKDAY_INDEX[String(weekdayName).toLowerCase()];
+  if (targetDay === undefined) {
+    return '';
+  }
+  const refDay = refDate.getUTCDay();
+  let delta = (targetDay - refDay + 7) % 7;
+  const d = new Date(refDate);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return isoDateUTC(d);
+}
+
+/**
+ * Parses an Amazon ETA phrase into an ISO date, using the email date for year
+ * inference and year-end rollover (month far in the past -> next year).
+ *
+ * @param {string} phrase ETA text after "Arriving:" / "Estimated delivery:" etc.
+ * @param {string} emailDateIso Email received date (yyyy-MM-dd).
+ * @return {string} ISO date or ''.
+ */
+function parseAmazonEtaPhrase(phrase, emailDateIso) {
+  if (!phrase || !emailDateIso) {
+    return '';
+  }
+  let text = String(phrase).trim().replace(/\./g, '');
+  const ref = new Date(emailDateIso + 'T12:00:00Z');
+
+  if (/^today$/i.test(text)) {
+    return emailDateIso;
+  }
+  if (/^tomorrow$/i.test(text)) {
+    const d = new Date(ref);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return isoDateUTC(d);
+  }
+  if (/^(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)$/i.test(text)) {
+    return nextWeekdayIso(text, ref);
+  }
+
+  text = text.replace(/^by\s+/i, '');
+  text = text.replace(/^[A-Za-z]+day,?\s+/i, '');
+
+  return parse_date_candidate_with_email_year(text, emailDateIso);
+}
+
+/**
+ * Like parse_date_candidate but anchors the year to the email date and rolls
+ * forward when the month/day would be far in the past.
+ *
+ * @param {string} value Month-day phrase.
+ * @param {string} emailDateIso Email received date (yyyy-MM-dd).
+ * @return {string} ISO date or ''.
+ */
+function parse_date_candidate_with_email_year(value, emailDateIso) {
+  value = String(value || '').trim().replace(/\./g, '');
+  const match = value.match(/^([A-Za-z]+)\s+(\d{1,2})(?:,\s*(\d{4}))?$/);
+  if (!match) {
+    return '';
+  }
+  const month = MONTH_INDEX[match[1].toLowerCase()];
+  if (month === undefined) {
+    return '';
+  }
+  const day = parseInt(match[2], 10);
+  const ref = new Date(emailDateIso + 'T12:00:00Z');
+  let year = match[3] ? parseInt(match[3], 10) : ref.getUTCFullYear();
+  let date = new Date(Date.UTC(year, month, day));
+  if (date.getUTCMonth() !== month || date.getUTCDate() !== day) {
+    return '';
+  }
+  if (!match[3] && date.getTime() < ref.getTime() - (45 * 86400000)) {
+    year += 1;
+    date = new Date(Date.UTC(year, month, day));
+  }
+  return isoDateUTC(date);
+}
+
+/**
+ * Finds Amazon-stated ETA markers in a normalized body with character positions.
+ *
+ * @param {string} normalizedBody Whitespace-normalized email body.
+ * @param {string} emailDateIso Email received date (yyyy-MM-dd).
+ * @return {Array<{index: number, eta: string}>} Sorted markers.
+ */
+function extract_amazon_eta_markers(normalizedBody, emailDateIso) {
+  const seen = new Set();
+  const markers = [];
+  AMAZON_ETA_MARKER_PATTERNS.forEach(function (pattern) {
+    const re = new RegExp(pattern.source, pattern.flags);
+    for (const match of normalizedBody.matchAll(re)) {
+      if (seen.has(match.index)) {
+        continue;
+      }
+      let phrase = match[1];
+      if (!phrase && /this\s+evening/i.test(match[0])) {
+        phrase = 'today';
+      }
+      const eta = phrase ? parseAmazonEtaPhrase(phrase, emailDateIso) : '';
+      if (eta) {
+        seen.add(match.index);
+        markers.push({ index: match.index, eta: eta });
+      }
+    }
+  });
+  markers.sort(function (a, b) { return a.index - b.index; });
+  return markers;
+}
+
+/**
+ * ETA from subject lines like "Now arriving today: Your Amazon package".
+ *
+ * @param {string} subject Email subject.
+ * @param {string} emailDateIso Email received date (yyyy-MM-dd).
+ * @return {{eta: string, source: string}}
+ */
+function extractAmazonEtaFromSubject(subject, emailDateIso) {
+  const subj = normalize_body(subject || '');
+  if (!subj || !emailDateIso) {
+    return { eta: '', source: '' };
+  }
+  if (/\b(?:now\s+)?arriving\s+today\b|\bout\s+for\s+delivery\s+today\b|\bwill be delivered\s+today\b/i.test(subj)) {
+    return { eta: emailDateIso, source: 'amazon_estimate' };
+  }
+  if (/\b(?:now\s+)?arriving\s+tomorrow\b/i.test(subj)) {
+    const d = new Date(emailDateIso + 'T12:00:00Z');
+    d.setUTCDate(d.getUTCDate() + 1);
+    return { eta: isoDateUTC(d), source: 'amazon_estimate' };
+  }
+  return { eta: '', source: '' };
+}
+
+/**
+ * Lower-confidence fallback: a single "[Weekday], [Month] [day]" in the
+ * shipping/delivery section when no primary ETA phrase matched.
+ *
+ * @param {string} body Email body text.
+ * @param {string} emailDateIso Email received date (yyyy-MM-dd).
+ * @return {string} ISO date or ''.
+ */
+function extractAmazonFallbackBodyEta(body, emailDateIso) {
+  const normalized = normalize_body(body);
+  if (!normalized || !emailDateIso) {
+    return '';
+  }
+  if (extract_amazon_eta_markers(normalized, emailDateIso).length) {
+    return '';
+  }
+  if (/\bOrder Confirmation\b/i.test(normalized) &&
+      !/\b(?:Shipping Confirmation|your package was shipped|your package will arrive|Expected Delivery)\b/i.test(normalized)) {
+    return '';
+  }
+  const startMatch = normalized.match(AMAZON_SHIPPING_SECTION_START_RE);
+  if (!startMatch) {
+    return '';
+  }
+  const section = normalized.slice(startMatch.index);
+  const uniqueDates = [];
+  const seen = new Set();
+  for (const match of section.matchAll(new RegExp(WEEKDAY_MONTH_DAY_RE.source, 'gi'))) {
+    const eta = parseAmazonEtaPhrase(match[0], emailDateIso);
+    if (eta && !seen.has(eta)) {
+      seen.add(eta);
+      uniqueDates.push(eta);
+    }
+  }
+  return uniqueDates.length === 1 ? uniqueDates[0] : '';
+}
+
+/**
+ * Returns the ETA from the nearest preceding marker at or before position.
+ * Kept for unit tests / debugging; production uses section-scoped assignment.
+ *
+ * @param {Array<{index: number, eta: string}>} markers Sorted ETA markers.
+ * @param {number} position Item block position.
+ * @return {string} ISO date or ''.
+ */
+function nearestPrecedingEta(markers, position) {
+  let best = '';
+  markers.forEach(function (marker) {
+    if (marker.index <= position) {
+      best = marker.eta;
+    }
+  });
+  return best;
+}
+
+const AMAZON_ETA_SECTION_BOUNDARY_RE = /\b(?:Grand Total|Order received)\b/i;
+
+/**
+ * End index for an ETA marker's scope: next marker, or a package/order boundary.
+ *
+ * @param {string} normalizedBody Whitespace-normalized body.
+ * @param {number} markerIndex Index into markers array.
+ * @param {Array<{index: number, eta: string}>} markers Sorted ETA markers.
+ * @return {number} Exclusive end position.
+ */
+function etaSectionEnd(normalizedBody, markerIndex, markers) {
+  if (markerIndex + 1 < markers.length) {
+    return markers[markerIndex + 1].index;
+  }
+  const after = normalizedBody.slice(markers[markerIndex].index);
+  const boundary = after.search(AMAZON_ETA_SECTION_BOUNDARY_RE);
+  if (boundary > 0) {
+    return markers[markerIndex].index + boundary;
+  }
+  return Infinity;
+}
+
+/**
+ * ADDITIVE (package ETA feature): maps item block positions to the Amazon
+ * "Arriving …" phrase for their package section (first item block after the
+ * marker until the next marker or Grand Total / Order received boundary).
+ *
+ * @param {string} body Email body text.
+ * @param {string} emailDateIso Email received date (yyyy-MM-dd).
+ * @return {Map<number, string>} position -> estimated_eta ISO date.
+ */
+function extractAmazonItemBlockEtaMap(body, emailDateIso) {
+  const normalized = normalize_body(body);
+  const markers = extract_amazon_eta_markers(normalized, emailDateIso);
+  if (!markers.length) {
+    return new Map();
+  }
+  const blocks = extractAmazonItemBlocksWithPositionsFromBody(body);
+  const map = new Map();
+  markers.forEach(function (marker, markerIndex) {
+    const sectionEnd = etaSectionEnd(normalized, markerIndex, markers);
+    for (let i = 0; i < blocks.length; i += 1) {
+      const block = blocks[i];
+      if (block.position > marker.index && block.position < sectionEnd) {
+        map.set(block.position, marker.eta);
+        break;
+      }
+    }
+  });
+  return map;
+}
+
+/**
+ * True when the body is a pre-ship order confirmation (not a shipping notice).
+ *
+ * @param {string} subject Email subject.
+ * @param {string} normalizedBody Whitespace-normalized body.
+ * @return {boolean}
+ */
+function isAmazonPreShipOrderConfirmation(subject, normalizedBody) {
+  const subj = normalize_body(subject || '');
+  if (/\bhas shipped\b/i.test(subj) || /^(?:shipped|out for delivery|now arriving)/i.test(subj)) {
+    return false;
+  }
+  if (!/\bOrder Confirmation\b/i.test(normalizedBody)) {
+    return false;
+  }
+  return !/\b(?:Shipping Confirmation|your package was shipped|your package will arrive|Expected Delivery)\b/i.test(normalizedBody);
+}
+
+/**
+ * Email-level ETA: primary body markers, then subject, then conservative fallback.
+ *
+ * @param {string} subject Email subject.
+ * @param {string} body Email body text.
+ * @param {string} emailDateIso Email received date (yyyy-MM-dd).
+ * @return {{eta: string, source: string}} ISO date and source tag.
+ */
+function extractAmazonEmailLevelEta(subject, body, emailDateIso) {
+  const normalized = normalize_body(body);
+  if (isAmazonPreShipOrderConfirmation(subject, normalized)) {
+    return { eta: '', source: '' };
+  }
+  const markers = extract_amazon_eta_markers(normalized, emailDateIso);
+  if (markers.length) {
+    return { eta: markers[0].eta, source: 'amazon_estimate' };
+  }
+  const subjectEta = extractAmazonEtaFromSubject(subject, emailDateIso);
+  if (subjectEta.eta) {
+    return subjectEta;
+  }
+  const fallback = extractAmazonFallbackBodyEta(body, emailDateIso);
+  if (fallback) {
+    return { eta: fallback, source: 'amazon_estimate_low' };
+  }
+  return { eta: '', source: '' };
+}
+
 function extract_item_name(body, domain) {
   const normalized = normalize_body(body);
   for (let i = 0; i < ITEM_ANCHOR_PATTERNS.length; i += 1) {

@@ -33,6 +33,15 @@ const UNATTRIBUTED_HEADERS = [
   'Updated At',
 ];
 
+const REORDER_HEADERS = [
+  'Item',
+  'Last Price/Unit',
+  'Last Order Date',
+  'Last Quantity',
+  'Times Ordered',
+  'Check Current Price',
+];
+
 const RUN_LOG_HEADERS = [
   'Timestamp',
   'Source',
@@ -156,14 +165,109 @@ function appendRunLog(summary) {
 }
 
 /**
- * Clears data rows of the tracking/inventory/unattributed tabs (NOT RunLog) so a
- * fixtures run is deterministic and repeatable.
+ * Rebuilds the ReorderReference tab from current tracking state. DERIVED view:
+ * one row per DISTINCT item (deduplicated by item_name_normalized). Full
+ * clear + bulk setValues, so it is always fresh and never has stale dedup.
+ *
+ * @param {Map} state Tracking state.
+ */
+function writeReorderReference(state) {
+  const sheet = getOrCreateTab(CONFIG.REORDER_TAB, REORDER_HEADERS);
+
+  const groups = new Map();
+  state.forEach(function (record) {
+    const key = record.item_name_normalized;
+    if (!key) {
+      return;
+    }
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(record);
+  });
+
+  const rows = [];
+  groups.forEach(function (records, normalized) {
+    let latest = records[0];
+    let latestDate = reorderRecordDate(latest);
+    records.forEach(function (record) {
+      const date = reorderRecordDate(record);
+      if (date >= latestDate) {
+        latestDate = date;
+        latest = record;
+      }
+    });
+
+    const distinctOrders = {};
+    records.forEach(function (record) { distinctOrders[record.order_number] = true; });
+
+    const displayName = reorderBestName(records, normalized);
+    const lastPricePerUnit = computePricePerUnit(latest.price_paid, latest.quantity);
+    const searchUrl = 'https://www.amazon.com/s?k=' + encodeURIComponent(displayName);
+    const linkFormula = '=HYPERLINK("' + searchUrl + '","Check current price")';
+
+    rows.push([
+      displayName,
+      lastPricePerUnit,
+      latestDate,
+      latest.quantity,
+      Object.keys(distinctOrders).length,
+      linkFormula,
+    ]);
+  });
+
+  rows.sort(function (a, b) { return String(a[0]).localeCompare(String(b[0])); });
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, REORDER_HEADERS.length).clearContent();
+  }
+  if (rows.length) {
+    sheet.getRange(2, 1, rows.length, REORDER_HEADERS.length).setValues(rows);
+  }
+}
+
+/**
+ * Best display date for a record: latest ISO among its known dates.
+ *
+ * @param {Object} record Line-item record.
+ * @return {string} ISO date or ''.
+ */
+function reorderRecordDate(record) {
+  const dates = [record.ordered_date, record.shipped_date, record.delivered_date, record.last_seen_email_date]
+    .filter(Boolean)
+    .sort();
+  return dates.length ? dates[dates.length - 1] : '';
+}
+
+/**
+ * Cleanest display name for an item group: the longest raw name seen, else the
+ * normalized key.
+ *
+ * @param {Array<Object>} records Records sharing a normalized name.
+ * @param {string} normalized Normalized key.
+ * @return {string} Display name.
+ */
+function reorderBestName(records, normalized) {
+  let best = '';
+  records.forEach(function (record) {
+    if ((record.item_name_raw || '').length > best.length) {
+      best = record.item_name_raw;
+    }
+  });
+  return best || normalized;
+}
+
+/**
+ * Clears data rows of the tracking/inventory/unattributed/reorder tabs (NOT
+ * RunLog) so a fixtures run is deterministic and repeatable.
  */
 function resetFixtureTabs() {
   const tabs = [
     [CONFIG.TRACKING_TAB, LINE_ITEM_HEADERS],
     [CONFIG.INVENTORY_TAB, INVENTORY_HEADERS],
     [CONFIG.UNATTRIBUTED_TAB, UNATTRIBUTED_HEADERS],
+    [CONFIG.REORDER_TAB, REORDER_HEADERS],
   ];
   tabs.forEach(function (entry) {
     const sheet = getOrCreateTab(entry[0], entry[1]);
@@ -192,6 +296,14 @@ function toBool(value) {
 function toInt(value) {
   const parsed = parseInt(value, 10);
   return isNaN(parsed) ? 0 : parsed;
+}
+
+function toFloatCell(value) {
+  if (value === '' || value == null) {
+    return '';
+  }
+  const parsed = parseFloat(value);
+  return isNaN(parsed) ? '' : parsed;
 }
 
 function splitIds(value) {

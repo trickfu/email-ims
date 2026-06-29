@@ -2,6 +2,36 @@
 
 This Apps Script project searches Gmail for likely order confirmation emails, extracts core order fields from each message body, and writes new order rows to a Google Sheet.
 
+## Sheet tabs (line-item pipeline)
+
+The current pipeline (`runSweep`) maintains five tabs:
+
+- **LineItemTracking** — persistent per-line-item state (one row per `order_number::normalized_name`): status, ordered/shipped/delivered dates, contributing message IDs, `added_to_inventory`, flags, `Price Paid` / `Price Per Unit`, and Amazon-stated **Estimated ETA** fields (see below).
+- **Inventory** — gated output: delivered, attributed line items, appended exactly once.
+- **Unattributed** — `UNKNOWN`/needs-review items, never guessed onto an order.
+- **RunLog** — one row per sweep (counts + errors).
+- **ReorderReference** — a DERIVED, reorder-helper view, rebuilt fresh from `LineItemTracking` at the end of every sweep (clear + bulk write, so it never holds stale dedup). One row per **distinct item** (deduplicated by `item_name_normalized`):
+  - **Item** — the cleanest raw name seen for that item.
+  - **Last Price/Unit** — `price_paid / quantity` from that item's most recent order (by date); blank if price or quantity is missing.
+  - **Last Order Date**, **Last Quantity** — from that most-recent order.
+  - **Times Ordered** — count of distinct orders containing the item.
+  - **Check Current Price** — a clickable `=HYPERLINK("https://www.amazon.com/s?k=<url-encoded item>", "Check current price")`. This is reference only: it lets you read the live price manually. The pipeline does not scrape Amazon or call any price API.
+
+Price extraction reads the per-item amount that follows `Quantity: <n>` in each Amazon item block (e.g. `... Quantity: 1 42.99 USD`), mirroring the existing total-extraction approach. It is additive and does not affect attribution, status, quantity, or dedup logic.
+
+### Package ETA (email-based only)
+
+Shipping and in-transit Amazon emails often include an estimated arrival such as `Arriving today`, `Arriving June 22`, or `Arriving: Wednesday, May 13`. The pipeline extracts these phrases from the email body (no carrier APIs, no tracking-page scraping) and stores them per line item using the same nearest-preceding-block attribution as prices and order numbers.
+
+**LineItemTracking columns:**
+
+- **Estimated ETA** — ISO date parsed from the Amazon-stated phrase. For **Shipped** / **Out for delivery** items this is the active estimate. For **Delivered** items the real arrival remains in **Delivered Date**; the last estimate may still be present for audit.
+- **ETA Source** — `amazon_estimate` when the date came from a shipping/in-transit email; `amazon_estimate_low` when inferred from a single standalone `[Weekday], [Month] [day]` in the shipping section (no explicit "Arriving" trigger); `actual` once a delivery email has arrived (meaning **Delivered Date** is the ground truth).
+- **Days Until ETA** — computed each sweep as `estimated_eta − today` for in-transit items with `amazon_estimate` or `amazon_estimate_low` (negative = past due).
+- **Overdue** — `TRUE` when `estimated_eta` has passed but status is still not **Delivered** (no delivery email yet). Useful for spotting packages that may be delayed.
+
+Supported phrasings include `Arriving: [date]`, `Arriving [weekday]`, `Arriving today` / `tomorrow`, `Estimated delivery: [date]`, `Expected Delivery: [date]`, `your package will arrive: [date]`, `Now Arriving [date]`, subject lines like `Now arriving today` / `Arriving tomorrow` / `Out for delivery today` (resolved relative to the email received date), `delivery date is: [date]`, and `arrive by [date]`. Order confirmations without a shipping marker are left blank — no guessing. Dates without a year default to the email's received year, with year-end rollover when the month would be far in the past relative to the email date.
+
 ## Files
 
 - `Config.gs`: Shared configuration, including the base Gmail search query and lookback window.

@@ -89,6 +89,7 @@ function processSweep(emails, options) {
     appendInventoryRows(gatedRecords);
     writeUnattributedRows(unknownRecords);
     saveTrackingState(state);
+    writeReorderReference(state);
     appendRunLog(summary);
   }
 
@@ -245,6 +246,92 @@ function logFixtureAssertions(state) {
 
   const unknownRows = rows.filter(function (record) { return record.order_number === UNKNOWN_ORDER; });
   console.log('UNKNOWN/Unattributed records: ' + unknownRows.length);
+
+  console.log('=== ETA assertions ===');
+  if (sunlu.length === 1) {
+    const sunluRecord = sunlu[0];
+    if (sunluRecord.estimated_eta === '2026-06-25' && sunluRecord.estimated_eta_source === 'actual') {
+      console.log('PASS: SUNLU estimated_eta from shipped email preserved; source=actual after delivery.');
+    } else {
+      console.log('FLAG: SUNLU ETA expected 2026-06-25 + source actual, got eta=' +
+        sunluRecord.estimated_eta + ' source=' + sunluRecord.estimated_eta_source);
+    }
+  }
+
+  const etaExpectations = [
+    { match: /hosyond.*oled/i, eta: '2026-06-22' },
+    { match: /elegoo.*dupont/i, eta: '2026-06-17' },
+    { match: /easycargo.*fan/i, eta: '2026-06-17' },
+    { match: /adaptermvp.*usb/i, eta: '2026-06-22' },
+    { match: /xhf.*cable zip/i, eta: '2026-06-17' },
+  ];
+  etaExpectations.forEach(function (expectation) {
+    const hit = rows.find(function (record) {
+      return expectation.match.test(record.item_name_raw || '') || expectation.match.test(record.item_name_normalized || '');
+    });
+    if (!hit) {
+      console.log('FLAG: no row for ETA expectation ' + expectation.match);
+      return;
+    }
+    if (hit.estimated_eta === expectation.eta && hit.estimated_eta_source === 'amazon_estimate') {
+      console.log('PASS: ' + hit.item_name_normalized.slice(0, 40) + '… eta=' + expectation.eta);
+    } else {
+      console.log('FLAG: ' + hit.item_name_normalized.slice(0, 40) + '… expected eta=' +
+        expectation.eta + ' (amazon_estimate), got eta=' + hit.estimated_eta + ' source=' + hit.estimated_eta_source);
+    }
+  });
+
+  logEtaExtractionSmokeTests();
+}
+
+/**
+ * Smoke-tests ETA extraction for subject-line and alternate body formats.
+ */
+function logEtaExtractionSmokeTests() {
+  console.log('=== ETA extraction smoke tests ===');
+  const cases = [
+    {
+      label: 'subject now arriving today',
+      subject: 'Now arriving today: Your Amazon package will be delivered today.',
+      body: 'Your Amazon package will be delivered today.',
+      date: '2026-05-14',
+      expect: { eta: '2026-05-14', source: 'amazon_estimate' },
+    },
+    {
+      label: 'subject arriving tomorrow',
+      subject: 'Arriving tomorrow: Your Amazon package',
+      body: '',
+      date: '2026-06-16',
+      expect: { eta: '2026-06-17', source: 'amazon_estimate' },
+    },
+    {
+      label: 'body your package will arrive',
+      subject: 'Your Amazon.com order #114-2335932-3428242 has shipped',
+      body: 'Hi Jack, your package will arrive:\n\nThursday, May 21\n\nTrack your package',
+      date: '2026-05-19',
+      expect: { eta: '2026-05-21', source: 'amazon_estimate' },
+    },
+    {
+      label: 'body Expected Delivery',
+      subject: 'Your Amazon.com order of "X" has shipped!',
+      body: 'Expected Delivery : Tuesday, May 19, 2026',
+      date: '2026-05-19',
+      expect: { eta: '2026-05-19', source: 'amazon_estimate' },
+    },
+    {
+      label: 'order confirmation no guess',
+      subject: 'Your Amazon.com order of "Foo".',
+      body: 'Order Confirmation\nYour guaranteed delivery date is:\nTuesday, May 26',
+      date: '2026-05-22',
+      expect: { eta: '', source: '' },
+    },
+  ];
+  cases.forEach(function (testCase) {
+    const got = extractAmazonEmailLevelEta(testCase.subject, testCase.body, testCase.date);
+    const ok = got.eta === testCase.expect.eta && got.source === testCase.expect.source;
+    console.log((ok ? 'PASS' : 'FLAG') + ': ' + testCase.label +
+      ' -> eta=' + got.eta + ' source=' + got.source);
+  });
 }
 
 /**
